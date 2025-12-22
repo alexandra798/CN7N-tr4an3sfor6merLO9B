@@ -1,0 +1,24 @@
+data:
+  T: 100
+  L: 20
+  C_raw: 7
+  features: ["bid_size","ask_size","OFI","spread","mid","dmid","cum_vol"]
+  dataset: "FI-2010"
+  batch_size: 64
+  horizons: [10,50,100]
+  steps_per_epoch: 200
+  fi2010:
+    root: "/Users/avelynekim/Desktop/deeplob-hft/FI2010_train.csv"   # 本地路径
+    split: "train"             # train/val/test
+model:
+  d_model: 64
+  depth: 2
+  pT: 10
+  pL: 5
+  g_dim: 16
+optim:
+  lr: 3e-4
+  weight_decay: 1e-4
+train:
+  epochs: 2
+  seed: 42

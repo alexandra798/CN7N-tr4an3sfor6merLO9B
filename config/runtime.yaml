@@ -1,0 +1,7 @@
+model_path: "artifacts/model.onnx"
+norm_stats: "artifacts/norm_stats.json"
+T: 100
+L: 20
+C_raw: 7
+threads: 1
+logits_names: ["logits_10","logits_50","logits_100"]

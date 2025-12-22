@@ -1,0 +1,12 @@
+T: 100
+L: 20
+C_raw: 7
+pT: 10
+pL: 5
+d_model: 64
+depth: 2
+g_dim: 16
+horizons: [10,50,100]
+opset: 18
+dynamic_axes:
+  input_lob: {0: "B"}
