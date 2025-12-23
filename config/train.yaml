@@ -1,7 +1,7 @@
 data:
   T: 100
   L: 20
-  C_raw: 7
+  C_raw: 8
   features: ["bid_size","ask_size","OFI","spread","mid","dmid","cum_vol"]
   dataset: "FI-2010"
   batch_size: 64
@@ -20,5 +20,5 @@ optim:
   lr: 3e-4
   weight_decay: 1e-4
 train:
-  epochs: 2
+  epochs: 20
   seed: 42

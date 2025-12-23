@@ -1,7 +1,20 @@
+# Runtime configuration for threaded pipeline
+# Copy to config/runtime_threaded.yaml and adjust paths
+
 model_path: "artifacts/model.onnx"
 norm_stats: "artifacts/norm_stats.json"
+
+# Model shape
 T: 100
 L: 20
-C_raw: 7
-threads: 1
-logits_names: ["logits_10","logits_50","logits_100"]
+C_raw: 8
+
+# ONNX Runtime settings
+threads: 1           # Intra-op threads (1 is usually best for low latency)
+
+# Benchmark settings
+num_frames: 10000    # Number of LOB frames to process
+
+# Performance tuning (optional)
+# enable_profiling: true
+# log_level: "INFO"

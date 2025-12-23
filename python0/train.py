@@ -10,13 +10,17 @@ from data.loaders import (
     synth_l2_stream, make_synth_labels,
     get_stream_builder, load_fi2010_XY
 )
-from data.features import make_feature_frame, update_norm_stats, save_norm_stats, load_norm_stats, normalize, NormStats
+from data.features import (
+    make_feature_frame, update_norm_stats, save_norm_stats, 
+    load_norm_stats, normalize, NormStats, FeatureConfig
+)
 from data.windows import RingWindow
 from model.lit_cvg import LiTCVG_Lite
-from model.losses import multi_horizon_ce
+from model.losses import multi_horizon_ce, adaptive_weights
 from data.fi2010 import fi2010_labels
 
 ART = "artifacts"
+
 
 class WindowDataset(Dataset):
     def __init__(self, windows: np.ndarray, labels: dict, horizons: list):
@@ -24,26 +28,49 @@ class WindowDataset(Dataset):
         self.labels = {int(h): labels[int(h)].astype(np.int64) for h in horizons}
         self.horizons = [int(h) for h in horizons]
 
-    def __len__(self): return self.x.shape[0]
+    def __len__(self): 
+        return self.x.shape[0]
 
     def __getitem__(self, i):
         x = self.x[i]
         y = {h: self.labels[h][i] for h in self.horizons}
         return x, y
 
-def build_windows_from_stream(cfg: dict, norm: NormStats, N: int, split: str = "train"):
+
+def build_windows_from_stream(cfg: dict, norm: NormStats, N: int, 
+                              split: str = "train",
+                              feature_config: FeatureConfig = None):
+    """Build (windows, labels) for either SYNTH or FI-2010.
+    
+    Args:
+        cfg: Configuration dict
+        norm: Normalization statistics
+        N: Number of windows to generate
+        split: 'train', 'val', or 'test'
+        feature_config: Feature configuration (if None, use default)
+    
+    Returns:
+        windows: (N, T, L, C_raw)
+        labels: {h: (N,)}
     """
-    Build (windows, labels) for either SYNTH or FI-2010.
-    windows: (N, T, L, C)
-    labels: {h: (N,)}
-    """
-    T = int(cfg["data"]["T"]); L = int(cfg["data"]["L"]); C = int(cfg["data"]["C_raw"])
+    T = int(cfg["data"]["T"])
+    L = int(cfg["data"]["L"])
     horizons = [int(h) for h in cfg["data"]["horizons"]]
     dataset = str(cfg["data"].get("dataset", "SYNTH")).upper()
-
+    
+    # Feature configuration
+    if feature_config is None:
+        feature_config = FeatureConfig(
+            include_price=cfg["data"].get("include_price", False),
+            include_volume_profile=cfg["data"].get("include_volume_profile", False),
+            ofi_levels=cfg["data"].get("ofi_levels", 1)
+        )
+    
+    C = feature_config.get_channel_count()
+    
     stream, meta = get_stream_builder(cfg, split)
 
-    # If FI-2010, we also load X/Y to get labels in a stable way.
+    # Load labels for FI-2010
     labels_full = None
     if dataset in ("FI-2010", "FI2010", "FI_2010"):
         X, Y, provided_horizons = load_fi2010_XY(cfg, split)
@@ -56,13 +83,9 @@ def build_windows_from_stream(cfg: dict, norm: NormStats, N: int, split: str = "
             layout=layout,
             L=L,
         )
-        # We will align label index with stream index (row index).
-        # Note: stream yields frames starting at row 0.
 
-    # For SYNTH, we build labels from mids once we have enough stream in memory.
-    # To avoid overcomplication, we keep SYNTH behavior the same as before (materialize).
+    # For SYNTH, materialize and generate labels
     if dataset == "SYNTH":
-        # Materialize just enough frames for N windows + max horizon + warmup
         stream_list = list(synth_l2_stream(
             L=L,
             n=N + max(horizons) + 2,
@@ -73,18 +96,19 @@ def build_windows_from_stream(cfg: dict, norm: NormStats, N: int, split: str = "
         stream = iter(stream_list)
 
     win = RingWindow(T=T, L=L, C=C)
-    # prime prev
     prev = next(stream)
     cum_vol = 0.0
 
     xs = []
     ys = {h: [] for h in horizons}
 
-    # stream index: prev corresponds to index 0, first cur is index 1
+    # Build windows
     t = 0
     for cur in stream:
         t += 1
-        frame, cum_vol = make_feature_frame(prev, cur, L=L, cum_vol_prev=cum_vol)
+        frame, cum_vol = make_feature_frame(
+            prev, cur, L=L, cum_vol_prev=cum_vol, config=feature_config
+        )
         frame = normalize(frame, norm)
         win.push(frame)
 
@@ -94,16 +118,26 @@ def build_windows_from_stream(cfg: dict, norm: NormStats, N: int, split: str = "
                 break
             xs.append(view[0])  # (T,L,C)
             for h in horizons:
-                ys[h].append(int(labels_full[h][t]))  # label aligned to current time index
+                ys[h].append(int(labels_full[h][t]))
         prev = cur
 
     windows = np.stack(xs, axis=0)
     labels = {h: np.asarray(ys[h], dtype=np.int64) for h in horizons}
+    
     return windows, labels
 
-def make_norm(cfg: dict, out_path: str, split: str = "train"):
+
+def make_norm(cfg: dict, out_path: str, split: str = "train", 
+              feature_config: FeatureConfig = None):
+    """Compute normalization statistics."""
     L = int(cfg["data"]["L"])
     dataset = str(cfg["data"].get("dataset", "SYNTH")).upper()
+    
+    if feature_config is None:
+        feature_config = FeatureConfig(
+            include_price=cfg["data"].get("include_price", False),
+            include_volume_profile=cfg["data"].get("include_volume_profile", False)
+        )
 
     if dataset == "SYNTH":
         stream = synth_l2_stream(L=L, n=25000, seed=int(cfg["train"]["seed"]))
@@ -112,7 +146,9 @@ def make_norm(cfg: dict, out_path: str, split: str = "train"):
         def frames_iter():
             nonlocal prev, cum_vol
             for cur in stream:
-                frame, cum_vol = make_feature_frame(prev, cur, L=L, cum_vol_prev=cum_vol)
+                frame, cum_vol = make_feature_frame(
+                    prev, cur, L=L, cum_vol_prev=cum_vol, config=feature_config
+                )
                 prev = cur
                 yield frame
         stats = update_norm_stats(frames_iter(), warmup=20000)
@@ -120,14 +156,15 @@ def make_norm(cfg: dict, out_path: str, split: str = "train"):
         return stats
 
     if dataset in ("FI-2010", "FI2010", "FI_2010"):
-        # stream warmup
         stream, _ = get_stream_builder(cfg, split)
         prev = next(stream)
         cum_vol = 0.0
         def frames_iter():
             nonlocal prev, cum_vol
             for cur in stream:
-                frame, cum_vol = make_feature_frame(prev, cur, L=L, cum_vol_prev=cum_vol)
+                frame, cum_vol = make_feature_frame(
+                    prev, cur, L=L, cum_vol_prev=cum_vol, config=feature_config
+                )
                 prev = cur
                 yield frame
         stats = update_norm_stats(frames_iter(), warmup=20000)
@@ -135,6 +172,7 @@ def make_norm(cfg: dict, out_path: str, split: str = "train"):
         return stats
 
     raise ValueError(f"Unknown dataset for norm: {dataset}")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -148,49 +186,159 @@ def main():
     cfg = load_yaml(args.config)
     ensure_dir(ART)
     set_seed(int(cfg["train"]["seed"]))
+    
+    # Feature configuration
+    feature_config = FeatureConfig(
+        include_price=cfg["data"].get("include_price", False),
+        include_volume_profile=cfg["data"].get("include_volume_profile", False),
+        ofi_levels=cfg["data"].get("ofi_levels", 1)
+    )
+    
+    # Update C_raw in config based on feature config
+    C_raw = feature_config.get_channel_count()
+    cfg["data"]["C_raw"] = C_raw
+    
+    print(f"📊 Feature Configuration:")
+    print(f"   Include price: {feature_config.include_price}")
+    print(f"   Include volume profile: {feature_config.include_volume_profile}")
+    print(f"   OFI levels: {feature_config.ofi_levels}")
+    print(f"   Total channels (C_raw): {C_raw}\n")
 
+    # Normalization statistics
     if args.make_norm or (not os.path.exists(args.norm)):
-        norm = make_norm(cfg, args.norm, split=args.split)
+        print("📈 Computing normalization statistics...")
+        norm = make_norm(cfg, args.norm, split=args.split, feature_config=feature_config)
     else:
+        print(f"📂 Loading normalization statistics from {args.norm}")
         norm = load_norm_stats(args.norm)
+    
+    # Verify norm stats match C_raw
+    if norm.mean.shape[0] != C_raw:
+        raise ValueError(
+            f"Norm stats channel count mismatch: "
+            f"loaded={norm.mean.shape[0]}, expected={C_raw}. "
+            f"Run with --make-norm to regenerate."
+        )
 
+    # Build dataset
     steps_per_epoch = int(cfg["data"].get("steps_per_epoch", 200))
     bs = int(cfg["data"]["batch_size"])
     N = steps_per_epoch * bs
 
-    windows, labels = build_windows_from_stream(cfg, norm, N=N, split=args.split)
+    print(f"🔨 Building training dataset ({N} windows)...")
+    windows, labels = build_windows_from_stream(
+        cfg, norm, N=N, split=args.split, feature_config=feature_config
+    )
+    print(f"   Windows shape: {windows.shape}")
+    print(f"   Labels: {list(labels.keys())}\n")
+    
     ds = WindowDataset(windows, labels, cfg["data"]["horizons"])
     dl = DataLoader(ds, batch_size=bs, shuffle=True, drop_last=True, num_workers=0)
 
+    # Build model
     mcfg = cfg["model"]
     model = LiTCVG_Lite(
-        T=int(cfg["data"]["T"]), L=int(cfg["data"]["L"]), C=int(cfg["data"]["C_raw"]),
-        pT=int(mcfg["pT"]), pL=int(mcfg["pL"]),
-        d_model=int(mcfg["d_model"]), depth=int(mcfg["depth"]),
-        g_dim=int(mcfg.get("g_dim", 16)), horizons=cfg["data"]["horizons"]
+        T=int(cfg["data"]["T"]), 
+        L=int(cfg["data"]["L"]), 
+        C=int(C_raw),  # Use computed C_raw
+        pT=int(mcfg["pT"]), 
+        pL=int(mcfg["pL"]),
+        d_model=int(mcfg["d_model"]), 
+        depth=int(mcfg["depth"]),
+        g_dim=int(mcfg.get("g_dim", 16)), 
+        horizons=cfg["data"]["horizons"]
     )
-    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["optim"]["lr"]), weight_decay=float(cfg["optim"]["weight_decay"]))
+    
+    print(f"🧠 Model: LiTCVG_Lite")
+    print(f"   Params: {sum(p.numel() for p in model.parameters()):,}\n")
+    
+    # Optimizer
+    opt = torch.optim.AdamW(
+        model.parameters(), 
+        lr=float(cfg["optim"]["lr"]), 
+        weight_decay=float(cfg["optim"]["weight_decay"])
+    )
 
-    weights = {int(cfg["data"]["horizons"][0]): 1.0}
-    for h in cfg["data"]["horizons"][1:]:
-        weights[int(h)] = 0.6 if int(h) == int(cfg["data"]["horizons"][1]) else 0.4
+    # Loss weights (adaptive exponential decay)
+    weight_strategy = cfg["train"].get("weight_strategy", "exponential")
+    decay = cfg["train"].get("weight_decay", 0.015)
+    
+    if weight_strategy == "adaptive":
+        weights = adaptive_weights(
+            cfg["data"]["horizons"], 
+            decay=decay, 
+            strategy="exponential"
+        )
+    else:
+        # Legacy weights
+        weights = {int(cfg["data"]["horizons"][0]): 1.0}
+        for h in cfg["data"]["horizons"][1:]:
+            weights[int(h)] = 0.6 if int(h) == int(cfg["data"]["horizons"][1]) else 0.4
+    
+    print(f"⚖️  Loss weights ({weight_strategy}):")
+    for h, w in weights.items():
+        print(f"   Horizon {h:3d}: {w:.4f}")
+    print()
 
+    # Training loop
     model.train()
+    best_loss = float('inf')
+    
     for epoch in range(int(cfg["train"]["epochs"])):
-        total = 0.0
-        for x, y in dl:
+        total_loss = 0.0
+        horizon_losses = {h: 0.0 for h in cfg["data"]["horizons"]}
+        
+        for batch_idx, (x, y) in enumerate(dl):
             x = x.float()
             yt = {int(h): torch.as_tensor(y[int(h)], dtype=torch.long) for h in y}
+            
+            # Forward pass
             out = model(x)
-            loss = multi_horizon_ce(out, yt, weights)
+            loss = multi_horizon_ce(out, yt, weights, return_details=False)
+            
+            # Backward pass
             opt.zero_grad()
             loss.backward()
             opt.step()
-            total += float(loss.item())
-        print(f"epoch={epoch} loss={total/len(dl):.4f}")
+            
+            total_loss += float(loss.item())
+            
+            # Per-horizon losses (for monitoring)
+            with torch.no_grad():
+                for h in cfg["data"]["horizons"]:
+                    key = f"logits_{int(h)}"
+                    h_loss = torch.nn.functional.cross_entropy(
+                        out[key], yt[int(h)]
+                    )
+                    horizon_losses[int(h)] += float(h_loss.item())
+        
+        avg_loss = total_loss / len(dl)
+        
+        # Print epoch summary
+        print(f"Epoch {epoch+1:2d}/{cfg['train']['epochs']} | Loss: {avg_loss:.4f}", end="")
+        for h in cfg["data"]["horizons"]:
+            h_avg = horizon_losses[int(h)] / len(dl)
+            print(f" | h{h}={h_avg:.4f}", end="")
+        print()
+        
+        # Save best model
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            torch.save({
+                "model": model.state_dict(), 
+                "cfg": cfg,
+                "feature_config": {
+                    "include_price": feature_config.include_price,
+                    "include_volume_profile": feature_config.include_volume_profile,
+                    "ofi_levels": feature_config.ofi_levels,
+                    "C_raw": C_raw
+                }
+            }, args.ckpt)
+            print(f"   ✅ Saved best checkpoint (loss={best_loss:.4f})")
+    
+    print(f"\n✅ Training complete! Best loss: {best_loss:.4f}")
+    print(f"📁 Checkpoint saved to {args.ckpt}")
 
-    torch.save({"model": model.state_dict(), "cfg": cfg}, args.ckpt)
-    print(f"saved ckpt -> {args.ckpt}")
 
 if __name__ == "__main__":
     main()
