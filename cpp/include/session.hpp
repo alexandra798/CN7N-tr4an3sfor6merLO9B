@@ -1,5 +1,5 @@
 #pragma once
-#include "/Users/avelynekim/onnxruntime/include/onnxruntime_cxx_api.h"
+#include "your/path/to/onnxruntime_cxx_api.h"
 #include <array>
 #include <vector>
 #include <string>
